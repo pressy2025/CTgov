@@ -82,6 +82,92 @@ attribute cards, results tables, and pipeline cards — update it in one place.
 `LF_EXAMPLES` holds the built-in BIOVECTRA and Thermo Fisher positioning documents wired to
 the example buttons.
 
+## Registry verification (openFDA) — `lfReg*` / `lfFda*`
+
+An optional, user-triggered pass that corrects `sizeTier` from public FDA record instead of
+trial footprint. Added because `lfSizeTierFromTrials` is a footprint proxy whose own comment
+admits it misses "Daiichi Sankyo at 2 trials, BioNTech at 16 countries". Measured on a
+BIOVECTRA run: **8 of the top 20 tiers corrected**, which for a CDMO seller drops AbbVie,
+GSK, Bayer and Takeda from 86 to 74 and lifts genuinely clinical-stage sponsors above them.
+
+**It adds no scoring dimension.** The six dimensions still sum to 100 and `LF_ARCHETYPE_FIT` is
+untouched — FDA data only improves two *inputs*: `sizeTier` (read by Buyer fit) and
+`sponsor.signals` (read by `lfTopSignal`).
+
+### The rule that governs everything
+
+> A zero may only be shown, scored, or sent to the model when `resolution === "absent"`.
+
+`unresolved` means "we could not look it up" and must stay inert and visually distinct (hatched
+amber, never a number). Conflating the two tells a CDMO seller that Janssen is an emerging
+biotech — worse than not verifying at all, because the model then has a number to cite.
+`absent` is unreachable unless a guard-approved probe actually ran.
+
+### Four things that will bite you
+
+1. **openFDA `sponsor_name` phrase matching is exact on the full field value.**
+   `sponsor_name:"IONIS"` returns 0 — openFDA spells it `IONIS PHARMS INC`. The **wildcard is
+   the primary probe**, not a fallback. Quote encoding is irrelevant.
+2. **Never emit an unquoted multi-token value.** `sponsor_name:JANSSEN BIOTECH` silently returns
+   `VERO BIOTECH INC` — a wrong answer with no error. Every probe is a quoted phrase or a single
+   token + `*`; `lfRegVariants` enforces it and the harness property-tests it.
+3. **A shared first token is not a shared company.** `HANGZHOU*` matched `HANGZHOU BINJIANG`,
+   an unrelated firm in the same city. `LF_REG_GENERIC_ROOTS` blocks place names and industry
+   words, and `lfRegAccept` additionally requires a second shared token when the first is generic.
+4. **HTTP 404 is an empty result, not an error** — the exact opposite of ClinicalTrials.gov,
+   where 403 is fatal and non-retryable. Do not generalise one registry's rules to the other.
+
+### Demotion is deliberately narrower than promotion
+
+Promotion on FDA evidence is safe. Demotion is not: BioNTech has a genuine Drugs@FDA zero
+(Comirnaty is filed by Pfizer) and demoting it to `emerging` *raised* its score 84 → 89 for a
+CDMO seller — an FDA zero would have promoted a multi-billion-dollar company as an emerging
+lead. So `lfSizeTier` only demotes `mid → emerging` when `trialCount < 5`, i.e. when the `mid`
+came from the late-phase rule alone (the Mirati/Immunovant "one global Phase 3" case) rather
+than from portfolio volume. It never demotes from `large`.
+
+### Degradation
+
+Same posture as the AI re-rank: verification may fail in any way and the deterministic results
+stay on screen. Per-sponsor errors are isolated inside `lfPool`, a 429 stops the pass rather
+than retrying a free public API, and `LF_REG_BUDGET_MS` bounds the worst case. With
+`LF_LAST.reg` empty every function returns exactly its pre-feature output — that additivity is
+what the harness checks first.
+
+`LF_LAST.reg` must be passed to **both** `lfRollupSponsors` call sites (`lfRenderResults` and
+`lfAiRerank`). Missing the second is silent: cards would show corrected tiers while the model
+received the uncorrected ones.
+
+### SEC EDGAR is deliberately NOT in the playground
+
+Verified 2026-07-28: of the three `CORS_PROXIES`, codetabs returns 522 and cors.eu.org returns
+an HTML error page. allorigins works for EDGAR full-text search (21,476 vs 21,480 bytes direct)
+but **truncates `company_tickers.json` at ~76 KB of 798 KB**, so ticker→CIK resolution cannot
+work in a browser. EDGAR full-text also caps retrievable hits at ~100 of 332 PDUFA mentions per
+year, needing ~30 paginated proxied requests, and that population (small-cap US biotech) barely
+intersects CT.gov ADC sponsors. **EDGAR belongs in the Modal backend**, where the required
+`User-Agent` is settable and results can be cached. `_source.display_names` carries
+name + ticker + CIK in one string, so the backend join needs no ticker map either.
+
+### Verifying
+
+```bash
+node tools/verify-registry.mjs          # units + guards + live resolution  (~15s)
+node tools/verify-registry.mjs --e2e    # + full CT.gov→openFDA pass and render checks (~40s)
+```
+
+This is the **one exception to "no test suite"**, and a narrow one: a single dependency-free
+`.mjs` that reads this HTML and evaluates the shipped `<script>` behind a DOM stub. There is no
+`package.json`, no build step, and nothing it touches is served — so the zero-build property
+holds. It earns its place because both bugs it now guards against reached a working build and
+produced *wrong answers with no error*: the `HANGZHOU BINJIANG` false match, and the inverted
+demotion rule. Run it after touching `lfRegAccept`, `lfRegVariants`, `LF_REG_GENERIC_ROOTS`,
+`lfSizeTier`, or `LF_SPONSOR_ALIASES`.
+
+The assertions that matter most: the unverified render must equal pre-feature output, no card may
+render `FDA · 0 apps`, unresolved must never move a tier, and no large-footprint sponsor may be
+demoted on an FDA zero.
+
 ## CORS: CT.gov is fine, EDGAR is not
 
 ClinicalTrials.gov and openFDA permit direct browser calls.

@@ -662,6 +662,53 @@
   .lf-badge.warn { color: #946800; border-color: #f4a261; background: #fff8e1; }
   .lf-badge.dim { color: var(--muted); }
 
+  /* Registry-verification badges. The four FDA states MUST be visually distinguishable from
+     each other — most importantly `unresolved` must not read as a zero. "We could not look this
+     company up" and "this company has no approvals" are opposite facts, and rendering them
+     alike is how a CDMO seller gets told Janssen is an emerging biotech. Hence unresolved gets
+     both a different colour AND different wording, never a number. */
+  .lf-badge.reg-matched    { color: #0d7d72; border-color: #7fc9bf; background: #e6f6f3; font-weight: 600; }
+  .lf-badge.reg-absent     { color: #5a6c70; border-color: var(--border); background: #f2f4f5; }
+  .lf-badge.reg-unresolved { color: #8a6d00; border-color: #e0c46a;
+                             background: repeating-linear-gradient(135deg, #fffbe9, #fffbe9 5px, #fdf3cf 5px, #fdf3cf 10px); }
+  .lf-badge.reg-ambiguous  { color: #8a6d00; border-color: #e0c46a; background: #fffbe9; }
+  .lf-badge.reg-unverified { color: #9aa7ab; border-color: #e8ecee; background: #fbfcfc; }
+  .lf-badge.reg-moved      { color: #6a3fa0; border-color: #c3aede; background: #f4eefc; font-weight: 600; }
+
+  .lf-caveat {
+    display: block;
+    margin-top: 6px;
+    padding: 6px 10px;
+    border-radius: 4px;
+    font-size: 11.5px;
+    line-height: 1.45;
+    background: #fffbe9;
+    border-left: 3px solid #e0c46a;
+    color: #7a6210;
+  }
+  .lf-caveat.info { background: var(--code-bg); border-left-color: var(--accent); color: var(--muted); }
+
+  .lf-verify-bar {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 14px; margin-bottom: 12px;
+    background: linear-gradient(90deg, #f4eefc 0%, #fbf8ff 100%);
+    border: 1px solid #ddcdf0; border-radius: 6px; font-size: 12px;
+  }
+  .lf-verify-bar .lf-verify-hint { flex: 1; min-width: 220px; color: var(--muted); }
+  .lf-verify-bar label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+  .lf-reg-summary {
+    display: flex; gap: 14px; flex-wrap: wrap;
+    font-size: 11.5px; color: var(--muted); padding: 2px 0;
+  }
+  .lf-reg-summary strong { color: var(--text); }
+  .lf-reg-evidence { font-size: 12px; }
+  .lf-reg-evidence table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+  .lf-reg-evidence td, .lf-reg-evidence th {
+    text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top;
+  }
+  .lf-reg-evidence th { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.3px; }
+  .lf-reg-evidence a { color: var(--accent-dark); font-family: SFMono-Regular, Consolas, monospace; font-size: 11px; }
+
   /* Seller archetype — the control that decides whether sponsor size counts for or against
      a lead. Deliberately the most prominent thing in the attribute grid: regex detection over
      prose misfires, and a wrong archetype silently inverts the entire ranking. */
@@ -2816,6 +2863,22 @@ const LF_DEMAND_MAP = {
     partnerLabel: "CRO/CDMO for the next asset · licensing & BD partners",
     window: "3–12 months",
   },
+  // ── Registry-sourced (openFDA), only present after a verification pass ──
+  // NOT activated for `investor`: an approval is the least interesting event for a capital
+  // deployer, and leaving it out preserves the archetype differentiation `activates` exists for.
+  "Recent FDA approval": {
+    demand: "Commercial-scale supply, launch inventory build, secondary packaging, serialisation, post-approval CMC changes",
+    activates: ["commercial_pharma_manufacturing_service_provider", "technology_service_provider", "drug_device_developer"],
+    partnerLabel: "Commercial CDMO · fill-finish · packaging & logistics",
+    window: "0–12 months from approval",
+  },
+};
+
+// Colour/tone for signals that come from the registry rather than from a trial. lfTopSignal
+// normally lifts these off a sample trial; a registry signal has no backing trial, so without
+// this it renders grey and toneless.
+const LF_SIGNAL_META = {
+  "Recent FDA approval": { color: "#8e44ad", tone: "approved product — commercial supply is live" },
 };
 
 // ── Sponsor rollup ──
@@ -2836,10 +2899,373 @@ function lfNormalizeSponsor(name) {
     .trim();
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════
+// REGISTRY VERIFICATION — openFDA (+ SEC EDGAR, phase 3)
+// ══════════════════════════════════════════════════════════════════════════════════════
+// The size tier above is a trial-footprint proxy and its own comment admits what it misses:
+// "Daiichi Sankyo at 2 trials, BioNTech at 16 countries ... the LLM re-rank corrects those from
+// its own knowledge." This layer corrects them from PUBLIC RECORD instead, which is citable.
+//
+// It changes NO scoring weight. The six dimensions still sum to 100. It only feeds better
+// INPUTS into two things that already exist: `sizeTier` (which Buyer fit reads) and
+// `sponsor.signals` (which lfTopSignal reads).
+//
+// ─── The one rule that matters ───
+// A ZERO may only be shown, scored, or sent to the model when resolution === "absent".
+// Every other state renders as "unresolved" and behaves exactly as if this never ran.
+// Conflating "confirmed no FDA applications" with "we could not look it up" is how this
+// feature tells a CDMO seller that Janssen is an emerging clinical-stage biotech — which is
+// WORSE than not building it, because the model now has a number to cite.
+// `absent` is unreachable by construction unless a guard-approved probe actually ran.
+
+const LF_FDA_BASE = "https://api.fda.gov";
+
+// Payload, not request count, is the binding constraint. Measured: JANSSEN*&limit=100 = 1.66 MB,
+// ASTRAZEN* = 872 KB, AKESO* = 3 KB. limit=10 keeps a 20-sponsor pass in the low MB.
+// meta.results.total is the EXACT total regardless of limit, so the count costs nothing extra;
+// only the family sample and the approval/product detail are sampled.
+const LF_REG_LIMIT = 10;
+const LF_REG_CONCURRENCY = 4;
+const LF_REG_BUDGET_MS = 45000;
+
+// Roots that match hundreds of unrelated companies. Probing these manufactures false matches
+// for exactly the emerging biotechs this feature exists to protect. Measured: BIO* returns 12
+// distinct name families across 173 applications. A sponsor whose root is blocked can still
+// resolve via the quoted-phrase rung, but can NEVER reach `absent`.
+// PLACE NAMES ARE THE SUBTLE HALF. Measured: "Hangzhou Zhongmei Huadong Pharmaceutical" probed
+// HANGZHOU* and matched "HANGZHOU BINJIANG" — a different company that merely shares a city.
+// Structurally this is identical to JANSSEN ~ JANSSEN PHARMS, so no prefix rule can separate
+// them; the only fix is knowing which tokens are places rather than companies.
+const LF_REG_GENERIC_ROOTS = new Set([
+  "bio", "bios", "pharma", "pharm", "pharms", "thera", "med", "meds", "gene", "cell",
+  "onco", "immuno", "immune", "nano", "life", "lifes", "health", "science", "sciences",
+  "national", "university", "hospital", "hospitals", "center", "centre", "institute",
+  "clinical", "research", "medical", "global", "new", "cure", "care", "drug", "drugs",
+  "vaccine", "protein", "peptide", "first", "united", "advanced", "applied",
+  // Places — a shared city says nothing about shared ownership.
+  "china", "chinese", "shanghai", "beijing", "jiangsu", "hangzhou", "nanjing", "suzhou",
+  "guangzhou", "shenzhen", "chengdu", "tianjin", "wuhan", "qilu", "zhejiang", "shandong",
+  "sichuan", "hunan", "hubei", "fujian", "anhui", "yunnan", "korea", "korean", "japan",
+  "japanese", "india", "indian", "europe", "european", "america", "american", "asia",
+  "asian", "pacific", "atlantic", "northern", "southern", "eastern", "western",
+]);
+
+// Hand-curated escape hatch for the cases no algorithm gets right, because the CT.gov name and
+// the FDA/SEC name share no tokens at all. Keyed by lfNormalizeSponsor output. Serves both the
+// FDA and SEC sides, and short-circuits the probe ladder to a single request.
+// Deliberately data, not logic: adding a row is safe and reversible; adding a heuristic is not.
+const LF_SPONSOR_ALIASES = {
+  "janssen": { fdaRoot: "JANSSEN", secTitle: "JOHNSON & JOHNSON", ticker: "JNJ", parent: "Johnson & Johnson" },
+  "janssen research development": { fdaRoot: "JANSSEN", secTitle: "JOHNSON & JOHNSON", ticker: "JNJ", parent: "Johnson & Johnson" },
+  "janssen sciences ireland": { fdaRoot: "JANSSEN", secTitle: "JOHNSON & JOHNSON", ticker: "JNJ", parent: "Johnson & Johnson" },
+  "msd": { fdaRoot: "MERCK", secTitle: "Merck & Co., Inc.", ticker: "MRK", parent: "Merck & Co." },
+  "merck sharp dohme": { fdaRoot: "MERCK", secTitle: "Merck & Co., Inc.", ticker: "MRK", parent: "Merck & Co." },
+  "merck sharp dohme corp": { fdaRoot: "MERCK", secTitle: "Merck & Co., Inc.", ticker: "MRK", parent: "Merck & Co." },
+  "genentech": { fdaRoot: "GENENTECH", secTitle: null, ticker: null, parent: "Roche" },
+  "hoffmann la roche": { fdaRoot: "HOFFMANN", secTitle: null, ticker: null, parent: "Roche (SIX-listed)" },
+  "roche": { fdaRoot: "HOFFMANN", secTitle: null, ticker: null, parent: "Roche (SIX-listed)" },
+  "emd serono": { fdaRoot: "EMD SERONO", secTitle: null, ticker: null, parent: "Merck KGaA" },
+  "emd serono research development institute": { fdaRoot: "EMD SERONO", secTitle: null, ticker: null, parent: "Merck KGaA" },
+  "boehringer ingelheim": { fdaRoot: "BOEHRINGER", secTitle: null, ticker: null, parent: "Boehringer Ingelheim (private)" },
+  "bristol myers squibb": { fdaRoot: "BRISTOL", secTitle: "BRISTOL MYERS SQUIBB CO", ticker: "BMY", parent: null },
+  "sanofi": { fdaRoot: "SANOFI", secTitle: "Sanofi", ticker: "SNY", parent: null },
+  "glaxosmithkline": { fdaRoot: "GLAXO", secTitle: "GSK plc", ticker: "GSK", parent: null },
+  "gsk": { fdaRoot: "GLAXO", secTitle: "GSK plc", ticker: "GSK", parent: null },
+  "astrazeneca": { fdaRoot: "ASTRAZENECA", secTitle: "ASTRAZENECA PLC", ticker: "AZN", parent: null },
+  "novartis": { fdaRoot: "NOVARTIS", secTitle: "NOVARTIS AG", ticker: "NVS", parent: null },
+  "daiichi sankyo": { fdaRoot: "DAIICHI", secTitle: null, ticker: null, parent: "Daiichi Sankyo (TSE-listed)" },
+  "eisai": { fdaRoot: "EISAI", secTitle: null, ticker: null, parent: "Eisai (TSE-listed)" },
+  "takeda": { fdaRoot: "TAKEDA", secTitle: "Takeda Pharmaceutical Co Ltd", ticker: "TAK", parent: null },
+  "beone medicines": { fdaRoot: "BEIGENE", secTitle: "BeiGene, Ltd.", ticker: "ONC", parent: "formerly BeiGene" },
+  "beigene": { fdaRoot: "BEIGENE", secTitle: "BeiGene, Ltd.", ticker: "ONC", parent: null },
+  "biontech se": { fdaRoot: "BIONTECH", secTitle: "BioNTech SE", ticker: "BNTX", parent: null },
+  "regeneron": { fdaRoot: "REGENERON", secTitle: "REGENERON PHARMACEUTICALS, INC.", ticker: "REGN", parent: null },
+};
+
+// Uppercase token list with corporate suffixes stripped — the QUERY side of the name.
+// lfNormalizeSponsor is the MATCHING side (lowercased, used for equality); they are deliberately
+// separate because a query needs original token order and case.
+function lfRegCore(rawName) {
+  const norm = lfNormalizeSponsor(rawName);
+  return norm ? norm.toUpperCase().split(" ").filter(Boolean) : [];
+}
+
+// A wildcard probe is only safe on a distinctive token. Blocking a root does not make a sponsor
+// unresolvable — it makes it UNRESOLVED rather than falsely `absent`, which is the whole point.
+function lfRegProbeGuard(token) {
+  if (!token || token.length < 4) return false;
+  if (/^\d+$/.test(token)) return false;
+  return !LF_REG_GENERIC_ROOTS.has(token.toLowerCase());
+}
+
+// The probe ladder. Wildcard leads because openFDA phrase matching is exact on the FULL field
+// value: sponsor_name:"IONIS" returns 0 because openFDA spells it "IONIS PHARMS INC", while
+// IONIS* returns 2. The quoted phrase survives only as the escape hatch for guard-blocked roots.
+// NEVER emit an unquoted multi-token value — sponsor_name:JANSSEN BIOTECH silently returns
+// VERO BIOTECH INC, a failure with no error to notice.
+function lfRegVariants(rawName) {
+  const core = lfRegCore(rawName);
+  if (!core.length) return [];
+  const root = core[0];
+  const probes = [];
+
+  const alias = LF_SPONSOR_ALIASES[lfNormalizeSponsor(rawName)];
+  if (alias && alias.fdaRoot) {
+    // A multi-token alias root ("EMD SERONO") must go out as a quoted phrase. Appending * to it
+    // would produce `sponsor_name:EMD SERONO*` — the unquoted multi-token form that silently
+    // returns an unrelated company. Single-token roots take the wildcard.
+    const multi = alias.fdaRoot.trim().includes(" ");
+    probes.push(multi
+      ? { rung: "alias", mode: "phrase", value: '"' + alias.fdaRoot + '"', root: alias.fdaRoot }
+      : { rung: "alias", mode: "wildcard", value: alias.fdaRoot + "*", root: alias.fdaRoot });
+    return probes;
+  }
+
+  if (lfRegProbeGuard(root)) {
+    probes.push({ rung: "P1", mode: "wildcard", value: root + "*", root });
+  }
+  if (core.length > 1) {
+    probes.push({ rung: "P2", mode: "phrase", value: '"' + core.join(" ") + '"', root });
+  }
+  // Stem rung, deliberately floored at 9 chars: it makes ASTRAZENECA → ASTRAZEN* eligible (104
+  // apps vs 80 for the exact form) while keeping BIONTECH (8) and MODERNA (7) ineligible — so
+  // both of those verified TRUE zeros survive as true zeros instead of being explained away.
+  if (root.length >= 9) {
+    const stem = root.slice(0, root.length - 3);
+    if (lfRegProbeGuard(stem)) probes.push({ rung: "P3", mode: "wildcard", value: stem + "*", root: stem });
+  }
+  return probes;
+}
+
+// Does an openFDA sponsor_name plausibly belong to this CT.gov sponsor?
+// Prefix-of-first-token ("JANSSEN" ⊂ "JANSSEN PHARMS") or full token-subset containment.
+// No fuzzy/Levenshtein matching — lfRollupSponsors already rejected that above with a documented
+// rationale about silently fusing distinct subsidiaries, and this is the same mistake with a
+// wider blast radius.
+function lfRegAccept(core, fdaName) {
+  const other = lfRegCore(fdaName);
+  if (!other.length || !core.length) return false;
+  // Defence in depth against the HANGZHOU BINJIANG case: a shared first token that is a place
+  // or an industry word is not evidence of the same company, so it must carry a second shared
+  // token. The probe guard normally stops these before a request is made; this also covers the
+  // alias path and any root that slips past the blocklist.
+  const firstShared = other[0].startsWith(core[0]) || core[0].startsWith(other[0]);
+  if (firstShared && LF_REG_GENERIC_ROOTS.has(core[0].toLowerCase())) {
+    return core.slice(1).some(t => other.includes(t));
+  }
+  if (firstShared) return true;
+  return core.every(t => other.includes(t));
+}
+
+// Concurrency limiter. Mirrors lfExecuteAll's posture: the pool never rejects, because one
+// sponsor's network failure must not abort the other nineteen.
+async function lfPool(items, size, fn) {
+  const out = new Array(items.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const i = cursor++;
+      try { out[i] = await fn(items[i], i); }
+      catch (e) { out[i] = { error: e && e.message ? e.message : String(e) }; }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, worker));
+  return out;
+}
+
+// openFDA returns HTTP 404 with {error:{code:"NOT_FOUND"}} for an empty result set. That is a
+// RESULT, not a failure — never retry it, never surface it as an error.
+// This is the exact OPPOSITE of ClinicalTrials.gov, where 403 is fatal and deliberately excluded
+// from retry. The two registries invert each other's rules; do not generalise one to the other.
+async function lfFdaFetch(path, search, extra) {
+  const params = Object.assign({ search, limit: String(LF_REG_LIMIT) }, extra || {});
+  const qs = Object.entries(params)
+    .map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v))
+    .join("&");
+  const url = LF_FDA_BASE + path + "?" + qs;
+  const r = await fetch(url, { headers: { "Accept": "application/json" } });
+  if (r.status === 404) return { url, empty: true, total: 0, results: [] };
+  if (r.status === 429) { const e = new Error("rate_limited"); e.rateLimited = true; throw e; }
+  if (!r.ok) throw new Error("openFDA HTTP " + r.status);
+  const j = await r.json();
+  return {
+    url,
+    empty: false,
+    total: ((j.meta || {}).results || {}).total || 0,
+    results: j.results || [],
+  };
+}
+
+function lfRegYyyymmdd(d) {
+  return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
+}
+
+// Walk the ladder for one sponsor. Returns the `fda` half of sponsor.reg.
+async function lfFdaResolve(rawName) {
+  const core = lfRegCore(rawName);
+  const alias = LF_SPONSOR_ALIASES[lfNormalizeSponsor(rawName)] || null;
+  const probes = lfRegVariants(rawName);
+  const out = {
+    resolution: "unresolved", confidence: "low", probes: [],
+    acceptedNames: [], rejectedNames: [], appCount: 0, sampled: false,
+    approvalsLast24m: 0, latestApproval: null,
+    marketedProducts: 0, applicationTypes: {}, viaAlias: alias ? true : false,
+    ndc: null,
+  };
+
+  if (!probes.length) {
+    // No safe probe was constructible (e.g. root "MSD" is 3 chars and not in the alias table).
+    // `absent` is unreachable from here — by design.
+    out.note = "no safe probe (root too short or too generic)";
+    return out;
+  }
+
+  const matchCore = alias && alias.fdaRoot ? lfRegCore(alias.fdaRoot) : core;
+  let sawResults = false;
+
+  for (const p of probes) {
+    let res;
+    try {
+      res = await lfFdaFetch("/drug/drugsfda.json", "sponsor_name:" + p.value);
+    } catch (e) {
+      if (e.rateLimited) { out.resolution = "skipped"; out.note = "openFDA rate limit"; return out; }
+      out.resolution = "error"; out.note = e.message;
+      out.probes.push({ rung: p.rung, mode: p.mode, value: p.value, error: e.message });
+      return out;
+    }
+    out.probes.push({ rung: p.rung, mode: p.mode, value: p.value, url: res.url, total: res.total });
+    if (res.empty || !res.results.length) continue;
+    sawResults = true;
+
+    // Group the sampled names into families and apply the similarity guard.
+    const families = new Map();
+    res.results.forEach(r => {
+      const n = r.sponsor_name || "";
+      if (!n) return;
+      const fam = lfRegCore(n)[0] || n;
+      if (!families.has(fam)) families.set(fam, { name: n, ok: lfRegAccept(matchCore, n), records: [] });
+      families.get(fam).records.push(r);
+    });
+    const accepted = Array.from(families.values()).filter(f => f.ok);
+    const rejected = Array.from(families.values()).filter(f => !f.ok);
+    out.rejectedNames = rejected.map(f => ({ name: f.name, why: "root mismatch" }));
+
+    if (!accepted.length) continue;                       // results existed, none are us → keep looking
+    if (accepted.length > 1) { out.resolution = "ambiguous"; return out; }
+
+    // One coherent family. meta.results.total is exact; the record sample is not.
+    // appCount only ever drives coarse thresholds (>=25, >=5), so a sampled family check is
+    // proportionate — but record `sampled` so the card can say so.
+    const fam = accepted[0];
+    out.resolution = "matched";
+    out.acceptedNames = [{ name: fam.name, apps: res.total }];
+    out.appCount = res.total;
+    out.sampled = res.total > res.results.length;
+    out.confidence = out.sampled ? "medium" : "high";
+
+    const cutoff = lfRegYyyymmdd(new Date(Date.now() - 730 * 86400000));
+    res.results.forEach(r => {
+      if (!lfRegAccept(matchCore, r.sponsor_name || "")) return;
+      const t = r.application_type;
+      if (t) out.applicationTypes[t] = (out.applicationTypes[t] || 0) + 1;
+      (r.submissions || []).forEach(s => {
+        if (s.submission_status !== "AP") return;
+        const d = parseInt(s.submission_status_date || "0", 10);
+        if (!d) return;
+        if (d >= cutoff) out.approvalsLast24m++;
+        if (!out.latestApproval || d > parseInt(out.latestApproval.date, 10)) {
+          out.latestApproval = {
+            date: s.submission_status_date,
+            appNo: r.application_number || null,
+            type: s.submission_type || null,
+            priority: s.review_priority || null,
+            brand: ((r.products || [])[0] || {}).brand_name || null,
+          };
+        }
+      });
+      (r.products || []).forEach(pr => {
+        const ms = (pr.marketing_status || "").toLowerCase();
+        if (ms === "prescription" || ms === "over-the-counter" || ms === "otc") out.marketedProducts++;
+      });
+    });
+    return out;
+  }
+
+  // Every probe came back empty (or returned only other companies).
+  if (sawResults) {
+    // We found companies but none were us — we cannot claim "no approvals".
+    out.resolution = "unresolved";
+    out.note = "matches existed but none passed the similarity guard";
+    return out;
+  }
+
+  // Genuinely nothing under any safe probe. Cross-check NDC before committing to `absent`,
+  // because Drugs@FDA coverage of CBER biologics is patchy: MODERNA* returns 0 applications
+  // yet /drug/ndc carries 4 Spikevax products under "Moderna US, Inc.". The two datasets
+  // disagree, and a zero that ignores that disagreement is a wrong answer.
+  const root = (alias && alias.fdaRoot) || core[0];
+  try {
+    const nd = await lfFdaFetch("/drug/ndc.json", 'labeler_name:"' + root + '"');
+    out.ndc = { total: nd.total, labelers: [], url: nd.url };
+    if (!nd.empty && nd.results.length) {
+      const labelers = new Set();
+      nd.results.forEach(r => { if (r.labeler_name) labelers.add(r.labeler_name); });
+      out.ndc.labelers = Array.from(labelers).slice(0, 4);
+      out.resolution = "unresolved";
+      out.note = "no Drugs@FDA application, but NDC products exist — datasets disagree";
+      return out;
+    }
+  } catch (e) {
+    out.ndc = { error: e.message };
+    out.resolution = "unresolved";
+    out.note = "NDC cross-check failed; cannot confirm a zero";
+    return out;
+  }
+
+  out.resolution = "absent";
+  out.confidence = "high";
+  return out;
+}
+
+// Interpretation layer. Deliberately archetype-INDEPENDENT so it can be computed once at fetch
+// time and cached — lfSetArchetype must keep re-scoring with zero network calls.
+function lfRegDerive(reg) {
+  const f = reg.fda || {};
+  const d = { sizeEvidence: "unknown", commercialSupply: "unknown", signals: [], caveats: [] };
+
+  if (f.resolution === "matched") {
+    if (f.appCount >= 25 || (f.appCount >= 5 && f.marketedProducts >= 10)) d.sizeEvidence = "large_commercial";
+    else if (f.marketedProducts >= 1) d.sizeEvidence = "commercial_stage";
+    d.commercialSupply = f.marketedProducts >= 1 ? "established" : "unknown";
+    if (f.approvalsLast24m >= 1) d.signals.push("Recent FDA approval");
+  } else if (f.resolution === "absent") {
+    d.sizeEvidence = "clinical_stage";
+    d.commercialSupply = "none_us";
+    d.caveats.push({ code: "fda_absent_confirmed", text: "No Drugs@FDA application and no NDC product under this name — no approved US product of its own." });
+    // Measured on BioNTech: `absent` is FACTUALLY correct (Comirnaty is filed by Pfizer, so
+    // BioNTech holds no application of its own) yet BioNTech is plainly not a clinical-stage
+    // company. An FDA zero cannot distinguish "never approved anything" from "partnered the
+    // filing out". That is why lfSizeTier will only act on this when the TRIAL evidence agrees.
+    d.caveats.push({ code: "fda_absent_partner_risk", text: "A zero here can also mean the approval was filed by a partner — it is not proof of clinical-stage status on its own." });
+  } else if (f.resolution === "unresolved") {
+    d.caveats.push({ code: "fda_unresolved", text: f.note || "Could not resolve this sponsor in openFDA. This is NOT evidence of zero approvals." });
+    if (f.ndc && f.ndc.labelers && f.ndc.labelers.length) {
+      d.commercialSupply = "established";
+      d.caveats.push({ code: "fda_absent_ndc_present", text: "NDC products exist under " + f.ndc.labelers.join(", ") + " — treat the Drugs@FDA zero as inconclusive." });
+    }
+  } else if (f.resolution === "ambiguous") {
+    d.caveats.push({ code: "fda_ambiguous", text: "Several unrelated companies share this name root — not attributable." });
+  }
+  return d;
+}
+
 // runs (from lfExecuteAll) → one record per sponsor, with the trials that produced it.
 // Dedupes trials by NCT across queries first, tracking which queries each trial matched —
 // that breadth becomes the strongest scoring dimension.
-function lfRollupSponsors(runs) {
+// `regByNorm` (optional) is the registry-verification cache, keyed by sponsorNorm — NOT by
+// display name, because the shortest-name rule below can change the label between runs.
+// Absent it, every sponsor scores exactly as it did before verification existed.
+function lfRollupSponsors(runs, regByNorm) {
   const byNct = new Map();
   let retrieved = 0;
 
@@ -2902,7 +3328,21 @@ function lfRollupSponsors(runs) {
   });
 
   const sponsors = Array.from(bySponsor.values());
-  sponsors.forEach(sp => { sp.trialCount = sp.trials.length; sp.sizeTier = lfSizeTier(sp); });
+  sponsors.forEach(sp => {
+    sp.trialCount = sp.trials.length;
+    // reg must be stamped BEFORE lfSizeTier runs — that is the whole attach point.
+    if (regByNorm && regByNorm.get) sp.reg = regByNorm.get(sp.sponsorNorm) || null;
+    sp.sizeTierBase = lfSizeTierFromTrials(sp);
+    sp.sizeTier = lfSizeTier(sp);
+    sp.sizeTierSource = sp.sizeTier === sp.sizeTierBase ? "trials"
+      : (["emerging", "mid", "large"].indexOf(sp.sizeTier) > ["emerging", "mid", "large"].indexOf(sp.sizeTierBase)
+          ? "fda_promoted" : "fda_demoted");
+    // Registry signals join the same Map the trial signals use, so lfTopSignal, the signal strip
+    // and the AI payload all pick them up with no further changes.
+    if (sp.reg && sp.reg.derived) {
+      sp.reg.derived.signals.forEach(t => sp.signals.set(t, (sp.signals.get(t) || 0) + 1));
+    }
+  });
   return { sponsors, retrieved };
 }
 
@@ -2939,11 +3379,53 @@ const LF_SIZE_TIERS = {
 // Pfizer, Novartis, BeOne, MSD, Regeneron — with no false positives. It still misses companies
 // that are large but thinly represented in one result set (Daiichi Sankyo at 2 trials,
 // BioNTech at 16 countries); the LLM re-rank corrects those from its own knowledge.
-function lfSizeTier(sponsor) {
+function lfSizeTierFromTrials(sponsor) {
   const hasP3 = sponsor.phases.has("PHASE3") || sponsor.phases.has("PHASE4");
   if (sponsor.trialCount >= 13 || (sponsor.trialCount >= 5 && sponsor.countries.size >= 20)) return "large";
   if (sponsor.trialCount >= 5 || hasP3) return "mid";
   return "emerging";
+}
+
+// Registry-corrected tier. This is the ONLY place FDA evidence touches scoring, and it does so
+// by improving an INPUT to Buyer fit rather than adding a dimension — the six dimensions still
+// sum to 100 and LF_ARCHETYPE_FIT is untouched.
+//
+// The first statement is the no-enrichment early return, and it is what guarantees that a run
+// without verification behaves byte-identically to before this feature existed.
+//
+// Asymmetric on purpose:
+//   PROMOTION is cheap and safe. It fixes the failure the comment above already admits —
+//     Daiichi Sankyo (7 apps, 9 marketed) and Janssen (96 apps) read "emerging" on trial
+//     footprint alone. Public record settles it.
+//   DEMOTION is dangerous and therefore requires the trial evidence to AGREE. Measured on
+//     BioNTech: openFDA correctly reports zero applications (Comirnaty is filed by Pfizer),
+//     which would demote a company that is obviously not emerging. Requiring "no Phase 3/4"
+//     means we only demote when trials and registry tell the same story.
+// Movement is capped at one step in either direction.
+function lfSizeTier(sponsor) {
+  const base = lfSizeTierFromTrials(sponsor);
+  const d = sponsor.reg && sponsor.reg.derived;
+  if (!d || d.sizeEvidence === "unknown") return base;
+
+  const order = ["emerging", "mid", "large"];
+
+  if (d.sizeEvidence === "large_commercial") return "large";
+  if (d.sizeEvidence === "commercial_stage" && base === "emerging") return "mid";
+
+  if (d.sizeEvidence === "clinical_stage") {
+    // Demote ONLY the case this was built for: a sponsor rated `mid` purely because it runs one
+    // late-phase trial. lfSizeTierFromTrials returns mid on `trialCount >= 5 || hasP3`, so the
+    // target is hasP3 with a thin portfolio (Mirati 1 trial/32 countries, Immunovant 1/16).
+    //
+    // Everything else keeps its trial-derived tier. Measured on BioNTech: 7 trials, 16 countries,
+    // Phase 1-2 only, and a genuine FDA zero because Comirnaty is filed by Pfizer. Demoting it
+    // to `emerging` RAISED its score 84 → 89 for a CDMO seller, i.e. an FDA zero would have
+    // promoted a multi-billion-dollar company as an emerging lead. A thin-portfolio requirement
+    // is what separates the two, because the volume of trials is evidence the registry is not.
+    if (base === "mid" && sponsor.trialCount < 5) return "emerging";
+    return base;
+  }
+  return base;
 }
 
 // ── Sponsor scoring (deterministic, 0–100) ──
@@ -3052,7 +3534,13 @@ function lfScoreSponsor(sponsor, attrs, totalQueries) {
 
 // Most actionable signal for a sponsor — urgency first, not simple frequency.
 // A single stagnating trial is a better reason to call than five routine new registrations.
+// "Recent FDA approval" leads because it is the only entry backed by a dated public record
+// rather than inferred from a status transition. If a real run comes back with ten identical
+// "Recent FDA approval" cards — the same flooding failure documented below for "Enrollment
+// complete" — demote it beneath "General Stagnation". That is a one-line edit here, which is
+// exactly why this is a table and not logic.
 const LF_SIGNAL_PRIORITY = [
+  "Recent FDA approval",
   "General Stagnation", "Enrollment complete", "Phase Transition candidate",
   "Newly Initiated", "Completed — check successor",
 ];
@@ -3064,8 +3552,10 @@ const LF_SIGNAL_PRIORITY = [
 function lfTopSignal(sponsor, archetype) {
   const pick = (type) => {
     const sample = sponsor.trials.find(t => t.signal.type === type);
-    return { type, count: sponsor.signals.get(type), color: sample ? sample.signal.color : "#5a6c70",
-             tone: sample ? sample.signal.tone : "" };
+    const meta = LF_SIGNAL_META[type];              // registry signals have no backing trial
+    return { type, count: sponsor.signals.get(type),
+             color: sample ? sample.signal.color : (meta ? meta.color : "#5a6c70"),
+             tone: sample ? sample.signal.tone : (meta ? meta.tone : "") };
   };
   if (archetype) {
     for (const type of LF_SIGNAL_PRIORITY) {
@@ -3268,6 +3758,70 @@ function lfRenderTrialRow(study, signal, showSponsor) {
     </div>`;
 }
 
+// The FDA badge. Four states, deliberately worded so that only `matched` and `absent` ever
+// carry or imply a number — see the CSS note above for why `unresolved` must look different
+// rather than just show 0.
+function lfRegBadgeHTML(sponsor) {
+  if (!sponsor.reg || !sponsor.reg.fda) {
+    return `<span class="lf-badge reg-unverified" title="Registry verification has not been run for this search.">Not verified</span>`;
+  }
+  const f = sponsor.reg.fda;
+  const probes = f.probes.map(p => p.rung + " " + p.value + " → " + (p.total != null ? p.total + " apps" : "error")).join("\n");
+  const base = "openFDA probes:\n" + (probes || "none constructible");
+
+  if (f.resolution === "matched") {
+    const sampled = f.sampled ? " (count exact; approval/product detail sampled from the first " + LF_REG_LIMIT + " records)" : "";
+    return `<span class="lf-badge reg-matched" title="${escapeHtml("Matched " + f.acceptedNames.map(a => a.name).join(", ") + sampled + "\n\n" + base)}">FDA · ${f.appCount} app${f.appCount === 1 ? "" : "s"}</span>`;
+  }
+  if (f.resolution === "absent") {
+    return `<span class="lf-badge reg-absent" title="${escapeHtml("No Drugs@FDA application AND no NDC product under this name. Confirmed against both datasets.\n\n" + base)}">No FDA application</span>`;
+  }
+  if (f.resolution === "ambiguous") {
+    return `<span class="lf-badge reg-ambiguous" title="${escapeHtml("Several unrelated companies share this name root, so no count is attributable.\n\n" + base)}">FDA ambiguous</span>`;
+  }
+  // unresolved / error / skipped all render the same way: honestly, and without a number.
+  return `<span class="lf-badge reg-unresolved" title="${escapeHtml("NOT a zero — we could not look this company up.\n" + (f.note || "") + "\n\n" + base)}">FDA unresolved</span>`;
+}
+
+function lfRegEvidenceHTML(sponsor) {
+  const reg = sponsor.reg;
+  if (!reg || !reg.fda) return "";
+  const f = reg.fda;
+  const rows = [];
+  rows.push(["Resolution", escapeHtml(f.resolution) + (f.confidence ? ` <span class="lf-badge dim">${escapeHtml(f.confidence)} confidence</span>` : "") + (f.viaAlias ? ` <span class="lf-badge dim">via alias table</span>` : "")]);
+  if (f.note) rows.push(["Note", escapeHtml(f.note)]);
+  if (f.acceptedNames.length) rows.push(["Matched as", f.acceptedNames.map(a => escapeHtml(a.name) + " (" + a.apps + " apps)").join("<br>")]);
+  if (f.rejectedNames.length) rows.push(["Rejected", f.rejectedNames.map(a => escapeHtml(a.name) + " — " + escapeHtml(a.why)).join("<br>")]);
+  if (Object.keys(f.applicationTypes).length) rows.push(["Application types (sampled)", Object.entries(f.applicationTypes).map(([k, v]) => escapeHtml(k) + " × " + v).join(" · ")]);
+  if (f.marketedProducts) rows.push(["Marketed products (sampled)", String(f.marketedProducts)]);
+  if (f.latestApproval) {
+    const a = f.latestApproval;
+    const d = String(a.date);
+    rows.push(["Latest approval", `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)} · ${escapeHtml(a.appNo || "")} ${escapeHtml(a.type || "")}${a.priority ? " · " + escapeHtml(a.priority) : ""}${a.brand ? " · " + escapeHtml(a.brand) : ""}`]);
+  }
+  if (f.approvalsLast24m) rows.push(["Approvals in last 24m (sampled)", String(f.approvalsLast24m)]);
+  if (f.ndc) {
+    rows.push(["NDC cross-check", f.ndc.error ? "failed: " + escapeHtml(f.ndc.error)
+      : (f.ndc.total || 0) + " products" + (f.ndc.labelers && f.ndc.labelers.length ? " — " + f.ndc.labelers.map(escapeHtml).join(", ") : "")]);
+  }
+  if (sponsor.sizeTierSource && sponsor.sizeTierSource !== "trials") {
+    rows.push(["Size tier", `${LF_SIZE_TIERS[sponsor.sizeTierBase].label} → <strong>${LF_SIZE_TIERS[sponsor.sizeTier].label}</strong> (${escapeHtml(sponsor.sizeTierSource.replace("fda_", "FDA "))})`]);
+  }
+  const probeRows = f.probes.map(p => `<tr><td>${escapeHtml(p.rung)}</td><td><code>sponsor_name:${escapeHtml(p.value)}</code></td><td>${p.total != null ? p.total : escapeHtml(p.error || "—")}</td><td>${p.url ? `<a href="${escapeHtml(p.url)}" target="_blank" rel="noopener">open ↗</a>` : ""}</td></tr>`).join("");
+
+  return `
+    <details class="lf-score-details lf-reg-evidence">
+      <summary>Regulatory evidence · openFDA</summary>
+      <table>
+        <tbody>${rows.map(([k, v]) => `<tr><th style="width:180px">${k}</th><td colspan="3">${v}</td></tr>`).join("")}</tbody>
+      </table>
+      <table>
+        <thead><tr><th>Rung</th><th>Probe</th><th>Total</th><th></th></tr></thead>
+        <tbody>${probeRows || '<tr><td colspan="4">no probe was constructible</td></tr>'}</tbody>
+      </table>
+    </details>`;
+}
+
 function lfRenderSponsorCard(sponsor, score, rank) {
   const sig = score.topSignal;
   const demand = sig ? LF_DEMAND_MAP[sig.type] : null;
@@ -3297,10 +3851,15 @@ function lfRenderSponsorCard(sponsor, score, rank) {
           <div class="lf-sponsor-meta">
             <span class="lf-badge">${escapeHtml(sponsor.agencyClass)}</span>
             <span class="lf-tier-badge ${tier}" title="${escapeHtml(`Inferred from this sponsor's footprint in these results — not headcount or revenue. ${LF_SIZE_TIERS[tier].desc}.`)}">${LF_SIZE_TIERS[tier].label}</span>
+            ${sponsor.sizeTierSource && sponsor.sizeTierSource !== 'trials'
+              ? `<span class="lf-badge reg-moved" title="${escapeHtml(`Corrected from ${LF_SIZE_TIERS[sponsor.sizeTierBase].label} using public FDA record rather than trial footprint.`)}">${LF_SIZE_TIERS[sponsor.sizeTierBase].label} → ${LF_SIZE_TIERS[sponsor.sizeTier].label}</span>` : ''}
+            ${lfRegBadgeHTML(sponsor)}
             <span>${sponsor.trialCount} matching ${sponsor.trialCount === 1 ? 'trial' : 'trials'}</span>
             <span>·</span><span>${phasePills}</span>
             ${countries.length ? `<span>·</span><span title="${escapeHtml(countries.join(', '))}">${countries.length} ${countries.length === 1 ? 'country' : 'countries'}</span>` : ''}
           </div>
+          ${(sponsor.reg && sponsor.reg.derived ? sponsor.reg.derived.caveats : []).map(c =>
+            `<span class="lf-caveat${c.code === 'fda_absent_confirmed' ? ' info' : ''}">${escapeHtml(c.text)}</span>`).join('')}
         </div>
         <div class="lf-score-total">
           <div class="lf-score-num">${score.total}</div>
@@ -3328,6 +3887,8 @@ function lfRenderSponsorCard(sponsor, score, rank) {
         <div class="lf-score-grid">${bars}</div>
       </details>
 
+      ${lfRegEvidenceHTML(sponsor)}
+
       <details class="lf-trials-details">
         <summary>${sponsor.trialCount} ${sponsor.trialCount === 1 ? 'trial' : 'trials'} · NCT evidence</summary>
         <div class="lf-trial-table">
@@ -3338,9 +3899,9 @@ function lfRenderSponsorCard(sponsor, score, rank) {
     </div>`;
 }
 
-function lfRenderResults(runs, attrs, queries) {
+function lfRenderResults(runs, attrs, queries, reg) {
   const failed = runs.filter(r => !r.ok);
-  const { sponsors, retrieved } = lfRollupSponsors(runs);
+  const { sponsors, retrieved } = lfRollupSponsors(runs, reg);
 
   // totalCount is per-query and queries overlap, so summing it double-counts. Report the
   // largest single-query count as the registry-scale figure instead of a fake grand total.
@@ -3382,6 +3943,33 @@ function lfRenderResults(runs, attrs, queries) {
   if (sponsors.length > shortlist.length) {
     const archName = lfArchetypeLabel((attrs.archetype || {}).value);
     html += `<div class="lf-note">Showing the top <strong>${shortlist.length}</strong> of ${sponsors.length} sponsors, ranked for a <strong>${escapeHtml(archName)}</strong> seller. Ranking is deterministic — expand <em>Why this score</em> on any card for the breakdown. Change the archetype above to re-rank the same trials.</div>`;
+  }
+
+  // Verification bar. Sits ABOVE the AI bar deliberately: verification must precede re-rank so
+  // the model reasons about the corrected tiers rather than the raw ones.
+  // User-triggered rather than automatic — it adds ~30 requests to a flow that currently returns
+  // in seconds, and openFDA's anonymous quota is 1000/day, so auto-running would burn a day's
+  // budget in ~30 searches.
+  {
+    const done = reg && reg.size;
+    const counts = { matched: 0, absent: 0, unresolved: 0, ambiguous: 0, moved: 0 };
+    if (done) {
+      shortlist.forEach(({ sponsor }) => {
+        const r = sponsor.reg && sponsor.reg.fda;
+        if (!r) return;
+        if (counts[r.resolution] !== undefined) counts[r.resolution]++;
+        else counts.unresolved++;
+        if (sponsor.sizeTierSource && sponsor.sizeTierSource !== "trials") counts.moved++;
+      });
+    }
+    html += `
+      <div class="lf-verify-bar">
+        <button class="btn btn-primary" id="lf-verify-btn" onclick="lfVerifyRegistry()">${done ? "Re-verify" : "Verify with openFDA"}</button>
+        <span class="lf-verify-hint">${done
+          ? `<span class="lf-reg-summary"><span><strong>${counts.matched}</strong> matched</span><span><strong>${counts.absent}</strong> confirmed clinical-stage</span><span><strong>${counts.unresolved + counts.ambiguous}</strong> unresolved</span><span><strong>${counts.moved}</strong> size tier${counts.moved === 1 ? "" : "s"} corrected</span></span>`
+          : `~${Math.min(LF_SHORTLIST_SIZE, shortlist.length) * 2} public openFDA calls over the top ${Math.min(LF_SHORTLIST_SIZE, shortlist.length)}. Corrects size tiers from public record instead of trial footprint, and adds approval signals. Nothing is sent anywhere — openFDA is called directly from your browser.`}</span>
+      </div>
+      <div id="lf-verify-status"></div>`;
   }
 
   // Re-rank bar only appears once an endpoint + token are saved. With no config this whole
@@ -3458,10 +4046,17 @@ function lfAiPayload(scored, attrs) {
       sponsorName: sponsor.sponsorName,
       agencyClass: sponsor.agencyClass,
       sizeTier: score.sizeTier,
+      sizeTierBasis: sponsor.sizeTierSource === "trials" ? "trials" : "fda",
       trialCount: sponsor.trialCount,
       phases: Array.from(sponsor.phases),
       signals: Array.from(sponsor.signals.keys()),
       score: score.total,
+      // Registry evidence. Only ever present after a verification pass, and the field names are
+      // chosen so the model cannot mistake "we could not look this up" for "there is nothing".
+      // NOTE: the server-side prompt in pipeline/ctgov_rerank.py must state that
+      // fdaStatus:"unresolved" is NOT evidence of zero approvals. Without that instruction this
+      // block makes the model MORE confidently wrong, because it now has a number to cite.
+      ...(sponsor.reg && sponsor.reg.fda ? { reg: lfAiRegFields(sponsor) } : {}),
       nctIds: sponsor.trials.slice(0, 3)
         .map(t => ((t.study.protocolSection || {}).identificationModule || {}).nctId)
         .filter(Boolean),
@@ -3469,7 +4064,34 @@ function lfAiPayload(scored, attrs) {
         .map(t => ((t.study.protocolSection || {}).identificationModule || {}).briefTitle)
         .filter(Boolean),
     })),
+    enrichment: (() => {
+      const seen = scored.slice(0, 25).map(s => s.sponsor.reg && s.sponsor.reg.fda).filter(Boolean);
+      if (!seen.length) return { ran: false };
+      const c = t => seen.filter(f => f.resolution === t).length;
+      return { ran: true, sources: ["openfda"], resolved: c("matched"), absent: c("absent"),
+               unresolved: seen.length - c("matched") - c("absent") };
+    })(),
   };
+}
+
+// Kept parallel to what the card renders — the UI joins the model's reply back onto these
+// sponsors by name, so anything the model reasons about must also be visible on screen.
+function lfAiRegFields(sponsor) {
+  const f = sponsor.reg.fda, d = sponsor.reg.derived || {};
+  const out = { fdaStatus: f.resolution };
+  if (f.resolution === "matched") {
+    out.fdaApps = f.appCount;
+    if (f.marketedProducts) out.marketedProducts = f.marketedProducts;
+    if (f.approvalsLast24m) out.approvalsLast24m = f.approvalsLast24m;
+    if (f.latestApproval) out.latestApproval = f.latestApproval.date;
+  }
+  if (d.commercialSupply && d.commercialSupply !== "unknown") out.commercialSupply = d.commercialSupply;
+  if (sponsor.sizeTierSource && sponsor.sizeTierSource !== "trials") {
+    out.tierAdjusted = sponsor.sizeTierBase + "->" + sponsor.sizeTier;
+  }
+  const caveats = (d.caveats || []).map(c => c.code);
+  if (caveats.length) out.caveats = caveats;
+  return out;
 }
 
 async function lfAiRerank() {
@@ -3478,7 +4100,10 @@ async function lfAiRerank() {
   const out = document.getElementById("lf-ai-panel");
   if (!cfg || !LF_LAST || !out) return;
 
-  const { sponsors } = lfRollupSponsors(LF_LAST.runs);
+  // LF_LAST.reg MUST be passed here as well as in lfRenderResults. Omitting it is the quiet
+  // failure mode: the cards would show corrected tiers and FDA evidence while the model received
+  // the uncorrected ones, so its reasoning would contradict what the user is looking at.
+  const { sponsors } = lfRollupSponsors(LF_LAST.runs, LF_LAST.reg);
   const scored = sponsors
     .map(sp => ({ sponsor: sp, score: lfScoreSponsor(sp, LF_LAST.attrs, LF_LAST.queries.length) }))
     .sort((a, b) => b.score.total - a.score.total);
@@ -3608,8 +4233,72 @@ function lfSetArchetype(value) {
     value, label: lfArchetypeLabel(value), hits: 0, detected: false, overridden: true,
   };
   document.getElementById("lf-attrs").innerHTML = lfRenderAttrs(LF_LAST.attrs);
+  // LF_LAST.reg is passed straight back in, so changing archetype re-scores against the
+  // already-fetched registry evidence and issues NO new network requests.
   document.getElementById("lf-results-body").innerHTML =
-    lfRenderResults(LF_LAST.runs, LF_LAST.attrs, LF_LAST.queries);
+    lfRenderResults(LF_LAST.runs, LF_LAST.attrs, LF_LAST.queries, LF_LAST.reg);
+}
+
+// ── Registry verification pass ──
+// Degradation posture is the same one the AI re-rank already uses: this can fail in any way it
+// likes and the deterministic results stay on screen. Per-sponsor errors are isolated inside
+// lfPool, a 429 stops the pass rather than retrying against a free public API, and a wall-clock
+// budget bounds the worst case.
+async function lfVerifyRegistry() {
+  if (!LF_LAST) return;
+  const btn = document.getElementById("lf-verify-btn");
+  const status = document.getElementById("lf-verify-status");
+  const { sponsors } = lfRollupSponsors(LF_LAST.runs, LF_LAST.reg);
+  const scored = sponsors
+    .map(sp => ({ sponsor: sp, score: lfScoreSponsor(sp, LF_LAST.attrs, LF_LAST.queries.length) }))
+    .sort((a, b) => b.score.total - a.score.total
+      || String(b.sponsor.newestLastUpdate || "").localeCompare(String(a.sponsor.newestLastUpdate || ""))
+      || b.sponsor.trialCount - a.sponsor.trialCount);
+  const targets = scored.slice(0, LF_SHORTLIST_SIZE).map(s => s.sponsor);
+
+  if (btn) { btn.disabled = true; btn.textContent = "Verifying…"; }
+  const reg = LF_LAST.reg instanceof Map ? LF_LAST.reg : new Map();
+  const deadline = Date.now() + LF_REG_BUDGET_MS;
+  let done = 0, rateLimited = false, skipped = 0;
+
+  const tick = (name) => {
+    if (!status) return;
+    status.innerHTML = `<div class="lf-note">Verifying <strong>${done}</strong> / ${targets.length}${name ? " — " + escapeHtml(name) : ""}</div>`;
+  };
+  tick("");
+
+  await lfPool(targets, LF_REG_CONCURRENCY, async (sp) => {
+    if (rateLimited || Date.now() > deadline) { skipped++; done++; tick(sp.sponsorName); return; }
+    let fda;
+    try {
+      fda = await lfFdaResolve(sp.sponsorName);
+    } catch (e) {
+      fda = { resolution: "error", confidence: "low", probes: [], acceptedNames: [], rejectedNames: [],
+              appCount: 0, approvalsLast24m: 0, marketedProducts: 0, applicationTypes: {}, note: e.message };
+    }
+    if (fda.resolution === "skipped" && /rate limit/i.test(fda.note || "")) rateLimited = true;
+    const entry = { v: 1, fetchedAt: new Date().toISOString(), sources: ["openfda"], fda };
+    entry.derived = lfRegDerive(entry);
+    reg.set(sp.sponsorNorm, entry);
+    done++; tick(sp.sponsorName);
+  });
+
+  LF_LAST.reg = reg;
+  if (btn) { btn.disabled = false; btn.textContent = "Re-verify"; }
+
+  document.getElementById("lf-results-body").innerHTML =
+    lfRenderResults(LF_LAST.runs, LF_LAST.attrs, LF_LAST.queries, LF_LAST.reg);
+
+  const note = document.getElementById("lf-verify-status");
+  if (note) {
+    if (rateLimited) {
+      note.innerHTML = `<div class="lf-warn">openFDA rate limit reached — ${done - skipped} of ${targets.length} verified. The anonymous quota is 1000 requests/day per IP. Unverified sponsors are shown as <em>Not verified</em>, never as zero.</div>`;
+    } else if (skipped) {
+      note.innerHTML = `<div class="lf-warn">Time budget reached — ${done - skipped} of ${targets.length} verified. The rest are shown as <em>Not verified</em>.</div>`;
+    } else {
+      note.innerHTML = "";
+    }
+  }
 }
 
 async function lfRun() {
@@ -3638,8 +4327,9 @@ async function lfRun() {
   document.getElementById("lf-results-section").style.display = "";
   document.getElementById("lf-results-body").innerHTML = '<div class="lf-empty"><span class="loader" style="border-color:var(--accent);border-top-color:transparent"></span>&nbsp;Running ' + queries.length + (queries.length === 1 ? ' query' : ' queries') + ' · fetching up to ' + (queries.length * Number(LF_PAGE_SIZE)).toLocaleString() + ' trials…</div>';
   const runs = await lfExecuteAll(queries);
-  LF_LAST = { runs, attrs, queries };
-  document.getElementById("lf-results-body").innerHTML = lfRenderResults(runs, attrs, queries);
+  // A fresh run discards any previous registry evidence — it belonged to a different sponsor set.
+  LF_LAST = { runs, attrs, queries, reg: new Map() };
+  document.getElementById("lf-results-body").innerHTML = lfRenderResults(runs, attrs, queries, LF_LAST.reg);
 }
 
 // Wire up
